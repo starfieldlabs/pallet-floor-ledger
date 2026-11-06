@@ -6,7 +6,9 @@ This is the first wedge of the pallet-yard operating system: **Floor ledger → 
 
 ## How to open it
 
-Double-click `index.html`. It opens in your web browser. Nothing to install, no account, no internet needed.
+**Online:** https://starfieldlabs.github.io/pallet-floor-ledger/ works on any phone or computer.
+
+**On this computer:** double-click `index.html`. It opens in your web browser, with nothing to install and no internet needed.
 
 The first time it opens, it loads a **demo yard**: 20 made-up workers with last week's and this week's counts. To start your own shop, go to **Setup → Erase everything**.
 
@@ -24,7 +26,11 @@ English and Spanish: the **EN / ES** switch at the top right.
 
 ## Where the data lives
 
-Only in the browser on the computer or phone where it was entered. Use **Setup → Download backup** to keep a copy. v0 has no login, no server and no syncing between devices.
+Only in the browser on the computer or phone where it was entered, including when it's opened from the online link. The website only delivers the app; it never receives anyone's data. Use **Setup → Download backup** to keep a copy. v0 has no login, no server and no syncing between devices.
+
+## Publishing changes
+
+The online version is served by GitHub Pages from the `main` branch of `starfieldlabs/pallet-floor-ledger`. Pushing to `main` updates the site within a minute or two.
 
 ## How the pay is worked out
 

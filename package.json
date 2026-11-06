@@ -1,0 +1,9 @@
+{
+  "name": "pallet-floor-ledger",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production tally to piece-rate payroll for pallet yards.",
+  "scripts": {
+    "test": "node --test"
+  }
+}

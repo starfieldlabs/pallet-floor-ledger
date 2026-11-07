@@ -1,9 +1,18 @@
-/* Pallet Floor Ledger — screens and what the buttons do. */
+/* Pallet Floor Ledger — screens and what the buttons do.
+ *
+ * Three modes:
+ *   local  everything on this device only (no sign-in; also the demo)
+ *   gate   the sign-in, sign-up and shop-picker screens
+ *   shop   a signed-in shop, kept the same on every device by sync.js
+ * Sharing is only offered when js/config.js has a Supabase project in it.
+ */
 (function () {
   'use strict';
 
   var P = window.Payroll;
+  var CFG = window.PFL_CONFIG || {};
   var MAX_COUNT = 100000;
+  var POLL_MS = 20000;
   var TABS = ['tally', 'payroll', 'costs', 'earnings', 'setup'];
   var TAB_LABEL = { tally: 'tabTally', payroll: 'tabPayroll', costs: 'tabCosts', earnings: 'tabEarnings', setup: 'tabSetup' };
 
@@ -20,8 +29,23 @@
     try { return /^es\b/i.test(navigator.language || '') ? 'es' : 'en'; } catch (e) { return 'en'; }
   }
   function prefGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
-  function prefSet(k, v) { try { localStorage.setItem(k, v); } catch (e) { /* not important */ } }
-  function uid(prefix) { return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 7); }
+  function prefSet(k, v) {
+    try {
+      if (v == null || v === '') localStorage.removeItem(k); else localStorage.setItem(k, v);
+    } catch (e) { /* not important */ }
+  }
+  /** Unique across devices: time plus 50+ random bits. */
+  function uid(prefix) {
+    var rand = '';
+    try {
+      var a = new Uint32Array(2);
+      crypto.getRandomValues(a);
+      rand = a[0].toString(36) + a[1].toString(36);
+    } catch (e) {
+      rand = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    }
+    return prefix + Date.now().toString(36) + rand.slice(0, 10);
+  }
 
   function esc(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
@@ -29,16 +53,28 @@
     });
   }
 
+  var storage = {
+    get: function (k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+    set: function (k, v) { localStorage.setItem(k, v); },
+    remove: function (k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } }
+  };
+
+  var cloud = CFG.supabaseUrl && CFG.supabaseKey && window.Cloud && window.Sync
+    ? Cloud.create({ url: CFG.supabaseUrl, key: CFG.supabaseKey, storage: storage })
+    : null;
+
   // ---------- state ----------
 
-  var loaded = Store.load();
-  var data = loaded.data;
+  var mode = 'local';
+  var data = null;
+  var lang = prefGet('pfl.lang');
+  var shop = null;          // { id, name, role } in shop mode
+  var engine = null;        // Sync engine in shop mode
+  var syncState = null;
   var startupNotice = null;
-  if (!data) {
-    data = Demo.build(today(), defaultLang());
-    if (loaded.status === 'corrupt') startupNotice = 'storageDamaged';
-    if (!Store.save(data)) startupNotice = 'saveFailed';
-  }
+  var joinCode = '';
+  var gate = freshGate('start');
+  var people = freshPeople(null);
 
   var ui = {
     tab: 'tally',
@@ -50,11 +86,24 @@
   var savedTab = prefGet('pfl.tab');
   if (TABS.indexOf(savedTab) >= 0) ui.tab = savedTab;
 
-  function t(key, vars) { return I18N.t(data.settings.lang, key, vars); }
-  function locale() { return data.settings.lang === 'es' ? 'es-US' : 'en-US'; }
+  function freshGate(screen) {
+    return { screen: screen, notice: '', error: '', email: prefGet('pfl.email') || '', shops: null, shopsError: '', joinError: '', autoOpen: false, reauth: false };
+  }
+  function freshPeople(shopId) {
+    return { shopId: shopId, loading: false, loaded: false, members: [], invites: [], error: '', lastInvite: null };
+  }
+
+  function t(key, vars) { return I18N.t(lang || 'en', key, vars); }
+  function locale() { return lang === 'es' ? 'es-US' : 'en-US'; }
+  function me() { var s = cloud && cloud.session(); return s ? s.user : null; }
+  function isOwner() { return mode !== 'shop' || (shop && shop.role === 'owner'); }
+  function roleName(r) { return t(r === 'owner' ? 'roleOwner' : 'roleSupervisor'); }
+  function shopTitle() {
+    return (data && data.settings.shopName) || (shop && shop.name) || t('unnamedShop');
+  }
 
   function persist(quiet) {
-    var ok = Store.save(data);
+    var ok = mode === 'shop' ? engine.save() : Store.save(data);
     if (!ok) toast(t('saveFailed'), true);
     else if (!quiet) toast(t('saved'));
     return ok;
@@ -84,6 +133,8 @@
   }
   function dayShort(s) { return dateText(s, { weekday: 'short', month: 'short', day: 'numeric' }); }
   function dayLong(s) { return dateText(s, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }); }
+  function codeText(code) { return String(code).slice(0, 4) + ' ' + String(code).slice(4); }
+  function normalizeCode(s) { return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 16); }
 
   // ---------- lookups ----------
 
@@ -105,6 +156,11 @@
   function itemLabel(item) {
     return item.sku + ' · ' + item.task + ' · ' + rateText(item.rateCents);
   }
+  /** This device's own (not demo) data, if it has any. */
+  function localRealData() {
+    var d = Store.peek();
+    return d && !d.demo && (d.workers.length || d.entries.length) ? d : null;
+  }
 
   // ---------- toast ----------
 
@@ -119,25 +175,172 @@
 
   // ---------- render ----------
 
+  var renderPending = false;
+
+  function typing() {
+    var a = document.activeElement;
+    return !!a && $('#view').contains(a) && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName) && a.type !== 'checkbox';
+  }
+
+  /** Redraw for changes from another device, but not under someone's fingers. */
+  function requestRender() {
+    if (typing()) { renderPending = true; return; }
+    render();
+  }
+
   function render() {
-    document.documentElement.lang = data.settings.lang;
-    $('#shop-name').textContent = data.settings.shopName || t('unnamedShop');
+    renderPending = false;
+    document.documentElement.lang = lang || 'en';
 
     var group = $('#lang-group');
     group.setAttribute('aria-label', t('language'));
     Array.prototype.forEach.call(group.querySelectorAll('button'), function (b) {
-      b.setAttribute('aria-pressed', String(b.getAttribute('data-lang') === data.settings.lang));
+      b.setAttribute('aria-pressed', String(b.getAttribute('data-lang') === lang));
     });
 
-    $('#tabs').innerHTML = TABS.map(function (k) {
+    var tabs = $('#tabs');
+    if (mode === 'gate') {
+      $('#shop-name').textContent = 'Pallet Floor Ledger';
+      renderStatus();
+      tabs.hidden = true;
+      tabs.innerHTML = '';
+      $('#banner').innerHTML = '';
+      $('#view').innerHTML = viewGate();
+      return;
+    }
+
+    $('#shop-name').textContent = shopTitle();
+    renderStatus();
+    tabs.hidden = false;
+    tabs.innerHTML = TABS.map(function (k) {
       return '<button type="button" data-action="tab" data-tab="' + k + '"' +
         (ui.tab === k ? ' aria-current="page"' : '') + '>' + esc(t(TAB_LABEL[k])) + '</button>';
     }).join('');
-
-    $('#banner').innerHTML = data.demo ? '<div class="banner">' + esc(t('demoBanner')) + '</div>' : '';
+    renderBanner();
 
     var views = { tally: viewTally, payroll: viewPayroll, costs: viewCosts, earnings: viewEarnings, setup: viewSetup };
     $('#view').innerHTML = views[ui.tab]();
+  }
+
+  function renderBanner() {
+    var html = '';
+    if (mode === 'local' && data.demo) {
+      html = cloud
+        ? '<div class="banner"><span>' + esc(t('demoBannerCloud')) + '</span> <button type="button" class="btn small" data-action="gate" data-screen="signup">' + esc(t('setUpMyShop')) + '</button></div>'
+        : '<div class="banner">' + esc(t('demoBanner')) + '</div>';
+    } else if (mode === 'shop' && syncState && syncState.state === 'signedOut') {
+      html = '<div class="banner alert"><span>' + esc(t('signedOutBanner')) + '</span> <button type="button" class="btn small primary" data-action="reauth">' + esc(t('signIn')) + '</button></div>';
+    }
+    $('#banner').innerHTML = html;
+  }
+
+  function renderStatus() {
+    var el = $('#product-line');
+    if (mode !== 'shop') {
+      el.className = 'product';
+      el.textContent = mode === 'gate' ? '' : 'Pallet Floor Ledger';
+      return;
+    }
+    var s = syncState || { state: 'idle', pending: 0 };
+    var cls, text;
+    if (s.state === 'offline') { cls = 'warn'; text = s.pending ? t('syncOffline', { n: s.pending }) : t('syncOfflineNone'); }
+    else if (s.state === 'signedOut') { cls = 'bad'; text = t('syncSignedOut', { n: s.pending }); }
+    else if (s.state === 'error') { cls = 'bad'; text = t('syncError', { n: s.pending }); }
+    else if (s.pending > 0 || s.state === 'saving') { cls = 'busy'; text = t('syncSaving'); }
+    else if (s.state === 'synced') { cls = 'ok'; text = t('syncSynced'); }
+    else { cls = 'busy'; text = t('syncConnecting'); }
+    el.className = 'product sync ' + cls;
+    el.textContent = text;
+  }
+
+  // ---------- sign-in screens ----------
+
+  function viewGate() {
+    if (gate.screen === 'signin' || gate.screen === 'signup') return viewAuth(gate.screen);
+    if (gate.screen === 'shops') return viewShops();
+    return viewStart();
+  }
+
+  function notice() {
+    return gate.notice ? '<p class="notice">' + esc(gate.notice) + '</p>' : '';
+  }
+
+  function viewStart() {
+    var real = localRealData();
+    return '<section class="card narrow hero">' +
+      '<h1>' + esc(t('heroTitle')) + '</h1>' +
+      '<p class="muted">' + esc(t('heroText')) + '</p>' +
+      notice() +
+      (joinCode ? '<p class="notice">' + esc(t('inviteWaiting')) + '</p>' : '') +
+      '<div class="button-stack">' +
+        '<button type="button" class="btn primary" data-action="gate" data-screen="signup">' + esc(t('createAccount')) + '</button>' +
+        '<button type="button" class="btn" data-action="gate" data-screen="signin">' + esc(t('signIn')) + '</button>' +
+        (joinCode ? '' : '<button type="button" class="btn ghost" data-action="use-local">' + esc(t(real ? 'keepLocal' : 'tryDemo')) + '</button>') +
+      '</div></section>';
+  }
+
+  function viewAuth(kind) {
+    var up = kind === 'signup';
+    return '<section class="card narrow">' +
+      '<h2>' + esc(t(up ? 'createAccount' : 'signIn')) + '</h2>' +
+      notice() +
+      (joinCode ? '<p class="notice">' + esc(t('inviteWaiting')) + '</p>' : '') +
+      '<form data-submit="' + kind + '" novalidate>' +
+        '<label class="field">' + esc(t('email')) +
+          '<input type="email" name="email" autocomplete="email" inputmode="email" autocapitalize="none" spellcheck="false" maxlength="254" value="' + esc(gate.email) + '"></label>' +
+        '<label class="field">' + esc(t(up ? 'newPassword' : 'password')) +
+          '<input type="password" name="password" autocomplete="' + (up ? 'new-password' : 'current-password') + '" maxlength="72"></label>' +
+        '<p class="form-error" role="alert" id="gate-error">' + esc(gate.error) + '</p>' +
+        '<button type="submit" class="btn primary wide">' + esc(t(up ? 'createAccount' : 'signIn')) + '</button>' +
+      '</form>' +
+      '<p class="switch">' + esc(t(up ? 'haveAccount' : 'noAccount')) + ' ' +
+        '<button type="button" class="link" data-action="gate" data-screen="' + (up ? 'signin' : 'signup') + '">' + esc(t(up ? 'signIn' : 'createAccount')) + '</button></p>' +
+      (up ? '' : '<p class="hint">' + esc(t('forgotHint')) + '</p>') +
+      '<p style="margin-top:12px"><button type="button" class="btn ghost" data-action="gate" data-screen="start">' + esc(t('back')) + '</button></p>' +
+    '</section>';
+  }
+
+  function viewShops() {
+    var user = me();
+    var html = '<section class="card narrow">' +
+      '<p class="muted">' + esc(t('signedInAs', { email: user ? user.email : '' })) + '</p>' +
+      notice() +
+      '<h2>' + esc(t('yourShops')) + '</h2>';
+    if (gate.shopsError) {
+      html += '<p class="form-error">' + esc(gate.shopsError) + '</p>' +
+        '<button type="button" class="btn" data-action="reload-shops">' + esc(t('tryAgain')) + '</button>';
+    } else if (!gate.shops) {
+      html += '<p class="muted">' + esc(t('loading')) + '</p>';
+    } else if (!gate.shops.length) {
+      html += '<p>' + esc(t('noShopsYet')) + '</p>';
+    } else {
+      html += '<div class="button-stack">' + gate.shops.map(function (s) {
+        return '<button type="button" class="btn shop-button" data-action="open-shop" data-id="' + esc(s.id) + '">' +
+          '<span>' + esc(s.name || t('unnamedShop')) + '</span><span class="muted">' + esc(roleName(s.role)) + '</span></button>';
+      }).join('') + '</div>';
+    }
+    html += '</section>';
+
+    html += '<section class="card narrow"><h2>' + esc(t('joinTitle')) + '</h2>' +
+      '<p class="hint" style="margin:0 0 8px">' + esc(t('joinHint')) + '</p>' +
+      '<form class="inline-form" data-submit="join-shop" novalidate>' +
+        '<input type="text" name="code" maxlength="20" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="ABCD 2345" aria-label="' + esc(t('inviteCode')) + '" value="' + esc(joinCode ? codeText(joinCode) : '') + '">' +
+        '<button type="submit" class="btn">' + esc(t('join')) + '</button>' +
+      '</form>' +
+      '<p class="form-error" role="alert" id="join-error">' + esc(gate.joinError) + '</p>' +
+      '</section>';
+
+    var real = localRealData();
+    html += '<section class="card narrow"><h2>' + esc(t('createShopTitle')) + '</h2>' +
+      '<form data-submit="create-shop" novalidate>' +
+        '<label class="field">' + esc(t('shopName')) + '<input type="text" name="name" maxlength="80" value="' + esc(real ? real.settings.shopName : '') + '"></label>' +
+        (real ? '<label class="check wrap" style="margin-bottom:12px"><input type="checkbox" name="copy" checked>' + esc(t('copyLocal')) + '</label>' : '') +
+        '<p class="form-error" role="alert" id="create-error"></p>' +
+        '<button type="submit" class="btn primary">' + esc(t('createShop')) + '</button>' +
+      '</form></section>';
+
+    html += '<section class="card narrow"><button type="button" class="btn" data-action="sign-out">' + esc(t('signOut')) + '</button></section>';
+    return html;
   }
 
   // ---------- Tally ----------
@@ -398,22 +601,32 @@
 
   function viewSetup() {
     var s = data.settings;
+    var owner = isOwner();
+    var lock = owner ? '' : ' disabled';
+    var lockNote = owner ? '' : '<p class="hint">' + esc(t('ownerOnly')) + '</p>';
     var dayOptions = [0, 1, 2, 3, 4, 5, 6].map(function (i) {
       var name = new Date(Date.UTC(2026, 10, 1 + i)).toLocaleDateString(locale(), { weekday: 'long', timeZone: 'UTC' });
       return '<option value="' + i + '"' + (i === s.weekStartDay ? ' selected' : '') + '>' + esc(name) + '</option>';
     }).join('');
 
-    var html =
+    var html = '';
+    if (mode === 'local' && cloud && !data.demo) {
+      html += '<section class="card share"><h2>' + esc(t('shareTitle')) + '</h2>' +
+        '<p>' + esc(t('shareText')) + '</p>' +
+        '<button type="button" class="btn primary" data-action="gate" data-screen="signup">' + esc(t('shareButton')) + '</button></section>';
+    }
+
+    html +=
       '<section class="card"><h2>' + esc(t('shop')) + '</h2>' +
-        '<form data-submit="save-shop" novalidate>' +
+        '<form data-submit="save-shop" novalidate><fieldset' + lock + '>' +
           '<label class="field">' + esc(t('shopName')) + '<input type="text" name="shopName" maxlength="80" value="' + esc(s.shopName) + '"></label>' +
           '<label class="field">' + esc(t('minWage')) + '<input type="number" name="minWage" inputmode="decimal" min="0" step="0.01" value="' + (s.minWageCents / 100).toFixed(2) + '">' +
             '<span class="hint" style="display:block">' + esc(t('minWageHint')) + '</span></label>' +
           '<label class="field">' + esc(t('otAfter')) + '<input type="number" name="ot" inputmode="decimal" min="1" max="168" step="0.5" value="' + s.overtimeAfterHours + '"></label>' +
           '<label class="field">' + esc(t('weekStarts')) + '<select name="weekStartDay">' + dayOptions + '</select></label>' +
           '<p class="form-error" role="alert" id="shop-error"></p>' +
-          '<button type="submit" class="btn primary">' + esc(t('save')) + '</button>' +
-        '</form>' +
+          (owner ? '<button type="submit" class="btn primary">' + esc(t('save')) + '</button>' : '') +
+        '</fieldset></form>' + lockNote +
       '</section>';
 
     var workers = data.workers.slice().sort(function (a, b) {
@@ -432,6 +645,7 @@
 
     html += '<section class="card"><h2>' + esc(t('rateCard')) + '</h2>' +
       '<p class="hint" style="margin-bottom:8px">' + esc(t('rateCardHint')) + '</p>' +
+      '<fieldset' + lock + '>' +
       '<div class="rate-row rate-head"><span>' + esc(t('sku')) + '</span><span>' + esc(t('task')) + '</span><span>' + esc(t('rate')) + '</span><span></span></div>' +
       data.items.map(function (i) {
         return '<div class="rate-row">' +
@@ -441,26 +655,417 @@
           '<label class="check"><input type="checkbox" data-change="item-active" data-id="' + esc(i.id) + '"' + (i.active !== false ? ' checked' : '') + '>' + esc(t('active')) + '</label>' +
         '</div>';
       }).join('') +
-      '<form data-submit="add-item" novalidate style="margin-top:12px">' +
-        '<div class="rate-row" style="border-bottom:0">' +
-          '<input type="text" name="sku" maxlength="60" placeholder="' + esc(t('sku')) + '" aria-label="' + esc(t('sku')) + '">' +
-          '<input type="text" name="task" maxlength="40" placeholder="' + esc(t('task')) + '" aria-label="' + esc(t('task')) + '">' +
-          '<input type="number" name="rate" inputmode="decimal" min="0" step="0.005" placeholder="0.00" aria-label="' + esc(t('rate')) + '">' +
-          '<button type="submit" class="btn small">' + esc(t('add')) + '</button>' +
-        '</div>' +
-        '<p class="form-error" role="alert" id="item-error"></p>' +
-      '</form></section>';
+      (owner
+        ? '<form data-submit="add-item" novalidate style="margin-top:12px">' +
+            '<div class="rate-row" style="border-bottom:0">' +
+              '<input type="text" name="sku" maxlength="60" placeholder="' + esc(t('sku')) + '" aria-label="' + esc(t('sku')) + '">' +
+              '<input type="text" name="task" maxlength="40" placeholder="' + esc(t('task')) + '" aria-label="' + esc(t('task')) + '">' +
+              '<input type="number" name="rate" inputmode="decimal" min="0" step="0.005" placeholder="0.00" aria-label="' + esc(t('rate')) + '">' +
+              '<button type="submit" class="btn small">' + esc(t('add')) + '</button>' +
+            '</div>' +
+            '<p class="form-error" role="alert" id="item-error"></p>' +
+          '</form>'
+        : '') +
+      '</fieldset>' + lockNote + '</section>';
 
-    html += '<section class="card"><h2>' + esc(t('dataTitle')) + '</h2>' +
-      '<p class="hint" style="margin-bottom:10px">' + esc(t('dataHint')) + '</p>' +
-      '<div class="button-stack">' +
-        '<button type="button" class="btn" data-action="backup">' + esc(t('backup')) + '</button>' +
-        '<label class="btn file-button">' + esc(t('restore')) + '<input type="file" accept="application/json,.json" data-change="restore-file"></label>' +
-        '<button type="button" class="btn" data-action="load-demo">' + esc(t('loadDemo')) + '</button>' +
-        '<button type="button" class="btn danger" data-action="erase">' + esc(t('erase')) + '</button>' +
-      '</div></section>';
+    if (mode === 'shop') {
+      html += viewPeople();
+      var user = me();
+      html += '<section class="card"><h2>' + esc(t('accountTitle')) + '</h2>' +
+        '<p class="muted">' + esc(t('signedInAs', { email: user ? user.email : '' })) + ' · ' + esc(roleName(shop.role)) + '</p>' +
+        '<div class="button-row">' +
+          '<button type="button" class="btn" data-action="switch-shop">' + esc(t('switchShop')) + '</button>' +
+          '<button type="button" class="btn" data-action="sign-out">' + esc(t('signOut')) + '</button>' +
+        '</div></section>';
+      html += '<section class="card"><h2>' + esc(t('dataTitle')) + '</h2>' +
+        '<p class="hint" style="margin-bottom:10px">' + esc(t('dataHintShop')) + '</p>' +
+        '<div class="button-stack">' +
+          '<button type="button" class="btn" data-action="backup">' + esc(t('backup')) + '</button>' +
+          (owner ? '<label class="btn file-button">' + esc(t('restore')) + '<input type="file" accept="application/json,.json" data-change="restore-file"></label>' : '') +
+        '</div></section>';
+    } else {
+      html += '<section class="card"><h2>' + esc(t('dataTitle')) + '</h2>' +
+        '<p class="hint" style="margin-bottom:10px">' + esc(t('dataHint')) + '</p>' +
+        '<div class="button-stack">' +
+          '<button type="button" class="btn" data-action="backup">' + esc(t('backup')) + '</button>' +
+          '<label class="btn file-button">' + esc(t('restore')) + '<input type="file" accept="application/json,.json" data-change="restore-file"></label>' +
+          '<button type="button" class="btn" data-action="load-demo">' + esc(t('loadDemo')) + '</button>' +
+          '<button type="button" class="btn danger" data-action="erase">' + esc(t('erase')) + '</button>' +
+        '</div></section>';
+    }
 
     return html;
+  }
+
+  function inviteLink(code) {
+    return location.href.split('#')[0].split('?')[0] + '?join=' + code;
+  }
+
+  function viewPeople() {
+    if (people.shopId !== shop.id) people = freshPeople(shop.id);
+    if (!people.loaded && !people.loading) loadPeople();
+    var owner = isOwner();
+    var user = me();
+    var html = '<section class="card"><h2>' + esc(t('peopleTitle')) + '</h2>' +
+      '<p class="hint" style="margin:0 0 8px">' + esc(t('peopleHint')) + '</p>';
+
+    if (people.error) {
+      html += '<p class="form-error">' + esc(people.error) + '</p>' +
+        '<button type="button" class="btn small" data-action="reload-people">' + esc(t('tryAgain')) + '</button>';
+    } else if (!people.loaded) {
+      html += '<p class="muted">' + esc(t('loading')) + '</p>';
+    } else {
+      html += '<ul class="list">' + people.members.map(function (m) {
+        var mine = user && m.user_id === user.id;
+        return '<li><div class="grow"><div class="entry-who">' + esc(m.email || '—') +
+          (mine ? ' <span class="muted">(' + esc(t('you')) + ')</span>' : '') + '</div>' +
+          '<div class="entry-what">' + esc(roleName(m.role)) + '</div></div>' +
+          (owner && !mine ? '<button type="button" class="btn small ghost" data-action="remove-member" data-id="' + esc(m.user_id) + '" data-email="' + esc(m.email) + '">' + esc(t('remove')) + '</button>' : '') +
+          '</li>';
+      }).join('') + '</ul>';
+    }
+
+    if (owner) {
+      html += '<form class="inline-form" data-submit="create-invite" novalidate style="margin-top:12px">' +
+        '<label>' + esc(t('inviteRole')) +
+          '<select name="role"><option value="supervisor">' + esc(t('roleSupervisor')) + '</option><option value="owner">' + esc(t('roleOwner')) + '</option></select></label>' +
+        '<button type="submit" class="btn">' + esc(t('createInvite')) + '</button>' +
+        '</form>' +
+        '<p class="form-error" role="alert" id="invite-error"></p>';
+
+      var last = people.lastInvite;
+      if (last) {
+        html += '<div class="invite">' +
+          '<p class="hint" style="margin:0">' + esc(t('inviteReady')) + '</p>' +
+          '<div class="invite-code">' + esc(codeText(last.code)) + '</div>' +
+          '<p class="muted" style="margin:0">' + esc(roleName(last.role)) + '</p>' +
+          '<input type="text" readonly class="invite-link" value="' + esc(inviteLink(last.code)) + '" aria-label="' + esc(t('copyLink')) + '">' +
+          '<div class="button-row">' +
+            '<button type="button" class="btn small" data-action="copy-invite">' + esc(t('copyLink')) + '</button>' +
+            (navigator.share ? '<button type="button" class="btn small" data-action="share-invite">' + esc(t('share')) + '</button>' : '') +
+          '</div></div>';
+      }
+
+      var open = people.invites.filter(function (v) { return !last || v.code !== last.code; });
+      if (open.length) {
+        html += '<h3>' + esc(t('openInvites')) + '</h3><ul class="list">' + open.map(function (v) {
+          return '<li><div class="grow"><div class="entry-who mono">' + esc(codeText(v.code)) + '</div>' +
+            '<div class="entry-what">' + esc(roleName(v.role)) + ' · ' + esc(t('expiresOn', { date: dateText(v.expires_at.slice(0, 10), { month: 'short', day: 'numeric' }) })) + '</div></div>' +
+            '<button type="button" class="btn small ghost" data-action="cancel-invite" data-id="' + esc(v.code) + '">' + esc(t('cancelInvite')) + '</button></li>';
+        }).join('') + '</ul>';
+      }
+    }
+    return html + '</section>';
+  }
+
+  // ---------- modes ----------
+
+  function cacheKeyFor(userId, shopId) { return 'pfl.cache.' + userId + '.' + shopId; }
+
+  function readLastShop() {
+    try {
+      var s = JSON.parse(prefGet('pfl.shop') || 'null');
+      return s && s.id && s.userId ? s : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function openLocal() {
+    stopEngine();
+    var loaded = Store.load();
+    data = loaded.data;
+    if (!data) {
+      data = Demo.build(today(), lang || defaultLang());
+      if (loaded.status === 'corrupt') startupNotice = 'storageDamaged';
+      if (!Store.save(data)) startupNotice = 'saveFailed';
+    }
+    if (!lang) lang = data.settings.lang || defaultLang();
+    data.settings.lang = lang;
+    mode = 'local';
+    shop = null;
+    resetDraft();
+  }
+
+  function showGate(screen, extra) {
+    stopEngine();
+    mode = 'gate';
+    shop = null;
+    data = null;
+    var keep = gate;
+    gate = freshGate(screen);
+    if (keep.email) gate.email = keep.email;
+    if (extra) for (var k in extra) gate[k] = extra[k];
+    if (!lang) lang = defaultLang();
+  }
+
+  function stopEngine() {
+    if (engine) engine.stop();
+    engine = null;
+    syncState = null;
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+
+  var pollTimer = null;
+
+  function makeRemote(shopId) {
+    return {
+      pull: function (q) {
+        var query = {
+          select: 'kind,id,data,deleted,updated_at',
+          shop_id: 'eq.' + shopId,
+          order: 'updated_at.asc,kind.asc,id.asc',
+          limit: String(q.limit),
+          offset: String(q.offset)
+        };
+        if (q.since) query.updated_at = 'gt.' + q.since;
+        if (q.liveOnly) query.deleted = 'is.false';
+        return cloud.rest('GET', 'records', { query: query });
+      },
+      push: function (rows) {
+        return cloud.rest('POST', 'records', {
+          query: { on_conflict: 'shop_id,kind,id' },
+          body: rows,
+          prefer: 'resolution=merge-duplicates,return=minimal'
+        });
+      }
+    };
+  }
+
+  function openShop(s, opts) {
+    opts = opts || {};
+    var user = me();
+    if (!user) { showGate('signin'); render(); return; }
+    stopEngine();
+    shop = { id: s.id, name: s.name || '', role: s.role === 'owner' ? 'owner' : 'supervisor' };
+    var initial = opts.initialData || Store.empty(lang);
+    engine = Sync.createEngine({
+      shopId: shop.id,
+      cacheKey: cacheKeyFor(user.id, shop.id),
+      storage: storage,
+      remote: makeRemote(shop.id),
+      initialData: initial,
+      uploadAll: !!opts.uploadAll,
+      onChange: function () { requestRender(); },
+      onStatus: onSyncStatus
+    });
+    data = engine.data;
+    data.settings.lang = lang;
+    data.demo = false;
+    mode = 'shop';
+    syncState = engine.status();
+    people = freshPeople(shop.id);
+    resetDraft();
+    ui.earningsWorker = '';
+    prefSet('pfl.shop', JSON.stringify({ id: shop.id, name: shop.name, role: shop.role, userId: user.id }));
+    prefSet('pfl.mode', 'shop');
+    var ticks = 0;
+    pollTimer = setInterval(function () {
+      if (!engine || document.hidden) return;
+      engine.syncNow();
+      if (++ticks % 10 === 0) checkMembership();   // about every 3 minutes
+    }, POLL_MS);
+    engine.syncNow();
+    render();
+  }
+
+  function onSyncStatus(s) {
+    var before = syncState && syncState.state;
+    syncState = s;
+    renderStatus();
+    if ((s.state === 'signedOut') !== (before === 'signedOut')) renderBanner();
+    if (s.rejected) {
+      toast(t('rejectedChanges'), true);
+      checkMembership();
+    }
+  }
+
+  /** In the background: is this person still in the shop, and in the same role? */
+  async function checkMembership() {
+    if (!shop || !me()) return;
+    var id = shop.id;
+    var rows;
+    try {
+      rows = await cloud.rest('GET', 'shop_members', { query: { select: 'role', shop_id: 'eq.' + id, user_id: 'eq.' + me().id } });
+    } catch (e) {
+      return; // offline or signed out; the status line already says so
+    }
+    if (!shop || shop.id !== id) return;
+    if (!rows.length) {
+      var name = shopTitle();
+      if (engine) engine.forget();
+      storage.remove(cacheKeyFor(me().id, id));
+      prefSet('pfl.shop', '');
+      showGate('shops', { notice: t('accessGone', { shop: name }) });
+      render();
+      loadShops();
+      return;
+    }
+    if (rows[0].role !== shop.role) {
+      shop.role = rows[0].role;
+      prefSet('pfl.shop', JSON.stringify({ id: shop.id, name: shop.name, role: shop.role, userId: me().id }));
+      requestRender();
+    }
+  }
+
+  async function loadShops() {
+    if (!me()) { showGate('signin'); render(); return; }
+    gate.shops = null;
+    gate.shopsError = '';
+    render();
+    if (joinCode && await acceptInvite(joinCode)) return;
+    try {
+      var rows = await cloud.rest('GET', 'shop_members', {
+        query: { select: 'shop_id,role,shops(name)', user_id: 'eq.' + me().id, order: 'joined_at.asc' }
+      });
+      if (mode !== 'gate') return;
+      gate.shops = rows.map(function (r) {
+        return { id: r.shop_id, role: r.role, name: (r.shops && r.shops.name) || '' };
+      });
+      if (gate.autoOpen && gate.shops.length === 1) {
+        openShop(gate.shops[0]);
+        return;
+      }
+    } catch (err) {
+      if (mode !== 'gate') return;
+      if (err.kind === 'auth') { showGate('signin'); render(); return; }
+      gate.shopsError = t(errKey(err));
+    }
+    render();
+  }
+
+  async function acceptInvite(code) {
+    try {
+      var shopId = await cloud.rpc('join_shop', { p_code: code });
+      joinCode = '';
+      prefSet('pfl.join', '');
+      var rows = await cloud.rest('GET', 'shop_members', {
+        query: { select: 'role,shops(name)', shop_id: 'eq.' + shopId, user_id: 'eq.' + me().id }
+      });
+      var r = rows[0] || {};
+      openShop({ id: shopId, role: r.role, name: (r.shops && r.shops.name) || '' });
+      toast(t('joined', { shop: shopTitle() }));
+      return true;
+    } catch (err) {
+      if (/invite_invalid/.test(err.message || '')) {
+        joinCode = '';
+        prefSet('pfl.join', '');
+      }
+      gate.joinError = t(errKey(err));
+      return false;
+    }
+  }
+
+  async function loadPeople() {
+    if (!shop) return;
+    var id = shop.id;
+    people.loading = true;
+    people.error = '';
+    try {
+      var members = await cloud.rest('GET', 'shop_members', {
+        query: { select: 'user_id,role,email,joined_at', shop_id: 'eq.' + id, order: 'joined_at.asc' }
+      });
+      var invites = shop.role === 'owner'
+        ? await cloud.rest('GET', 'shop_invites', {
+            query: { select: 'code,role,expires_at', shop_id: 'eq.' + id, used_at: 'is.null', order: 'created_at.desc' }
+          })
+        : [];
+      if (!shop || shop.id !== id) return;
+      people.members = members;
+      people.invites = invites.filter(function (v) { return Date.parse(v.expires_at) > Date.now(); });
+    } catch (err) {
+      if (!shop || shop.id !== id) return;
+      people.error = t(errKey(err));
+    }
+    people.loading = false;
+    people.loaded = true;
+    if (ui.tab === 'setup' && mode === 'shop') requestRender();
+  }
+
+  function errKey(err) {
+    if (!err) return 'errServer';
+    if (err.kind === 'network') return 'errNetwork';
+    var c = (err.code || '') + ' ' + (err.message || '');
+    if (/invalid_credentials|invalid_grant|Invalid login/i.test(c)) return 'errBadLogin';
+    if (/user_already_exists|already registered/i.test(c)) return 'errUserExists';
+    if (/weak_password/i.test(c)) return 'errWeakPassword';
+    if (/rate_limit|over_request|over_email/i.test(c)) return 'errRateLimit';
+    if (/email_not_confirmed/i.test(c)) return 'errConfirmEmail';
+    if (/email_address_not_authorized|sending confirmation/i.test(c)) return 'errEmailSetup';
+    if (/signup_disabled/i.test(c)) return 'errSignupsOff';
+    if (/email_address_invalid|validation_failed/i.test(c)) return 'errEmail';
+    if (/invite_invalid/.test(c)) return 'errInviteInvalid';
+    if (/name_required/.test(c)) return 'errShopName';
+    if (/too_many_shops/.test(c)) return 'errTooManyShops';
+    if (/too_many_invites/.test(c)) return 'errTooManyInvites';
+    if (/not_owner|42501/.test(c) || err.status === 403) return 'errNotOwner';
+    return 'errServer';
+  }
+
+  function pendingFor(userId) {
+    var n = 0;
+    var prefix = 'pfl.cache.' + userId + '.';
+    try {
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (k && k.indexOf(prefix) === 0) {
+          var c = JSON.parse(localStorage.getItem(k) || 'null');
+          if (c && c.outbox) n += Object.keys(c.outbox).length;
+        }
+      }
+    } catch (e) { /* count what we can */ }
+    return n;
+  }
+
+  function forgetDevice(userId) {
+    var prefix = 'pfl.cache.' + userId + '.';
+    var doomed = [];
+    try {
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (k && k.indexOf(prefix) === 0) doomed.push(k);
+      }
+    } catch (e) { /* ignore */ }
+    doomed.forEach(function (k) { storage.remove(k); });
+  }
+
+  function signOut() {
+    var user = me();
+    var n = user ? pendingFor(user.id) : 0;
+    if (n && !confirm(t(n === 1 ? 'confirmSignOutPending1' : 'confirmSignOutPending', { n: n }))) return;
+    if (engine) engine.forget();
+    stopEngine();
+    if (user) forgetDevice(user.id);
+    prefSet('pfl.shop', '');
+    prefSet('pfl.mode', '');
+    cloud.signOut();
+    showGate('start');
+    render();
+  }
+
+  function afterSignIn(session) {
+    prefSet('pfl.email', session.user.email);
+    var last = readLastShop();
+    if (gate.reauth && last && last.userId === session.user.id && !joinCode) {
+      openShop(last);
+      return;
+    }
+    showGate('shops', { autoOpen: true });
+    loadShops();
+  }
+
+  /** Lock a form while it waits for the server; the button says "Loading…". */
+  function busy(form, on) {
+    Array.prototype.forEach.call(form.querySelectorAll('button, input, select'), function (el) { el.disabled = on; });
+    var submit = form.querySelector('button[type="submit"]');
+    if (!submit) return;
+    if (on) {
+      submit.setAttribute('data-label', submit.textContent);
+      submit.textContent = t('loading');
+    } else if (submit.hasAttribute('data-label')) {
+      submit.textContent = submit.getAttribute('data-label');
+    }
   }
 
   // ---------- actions ----------
@@ -491,12 +1096,72 @@
   }
 
   function replaceData(next, message) {
-    data = next;
+    if (mode === 'shop') {
+      if (!engine.replaceAll(next)) toast(t('saveFailed'), true);
+    } else {
+      data = next;
+      data.settings.lang = lang;
+      persist(true);
+    }
     resetDraft();
     ui.earningsWorker = '';
-    persist(true);
     render();
     toast(message);
+  }
+
+  function backupData() {
+    var copy = JSON.parse(JSON.stringify(data));
+    copy.demo = !!data.demo;
+    return copy;
+  }
+
+  async function copyInvite() {
+    var link = inviteLink(people.lastInvite.code);
+    try {
+      await navigator.clipboard.writeText(link);
+      toast(t('linkCopied'));
+    } catch (e) {
+      var input = $('.invite-link');
+      if (input) { input.focus(); input.select(); }
+      toast(t('copyFailed'), true);
+    }
+  }
+
+  function shareInvite() {
+    var code = people.lastInvite.code;
+    navigator.share({
+      title: 'Pallet Floor Ledger',
+      text: t('inviteShareText', { shop: shopTitle(), code: codeText(code) }),
+      url: inviteLink(code)
+    }).catch(function () { /* closed the share sheet */ });
+  }
+
+  async function removeMember(userId, email) {
+    if (!confirm(t('confirmRemove', { email: email || '?' }))) return;
+    try {
+      var gone = await cloud.rest('DELETE', 'shop_members', {
+        query: { shop_id: 'eq.' + shop.id, user_id: 'eq.' + userId },
+        prefer: 'return=representation'
+      });
+      if (!gone || !gone.length) { toast(t('errNotOwner'), true); return; }
+      toast(t('removed'));
+    } catch (err) {
+      toast(t(errKey(err)), true);
+    }
+    people.loaded = false;
+    requestRender();
+  }
+
+  async function cancelInvite(code) {
+    try {
+      await cloud.rest('DELETE', 'shop_invites', { query: { code: 'eq.' + code } });
+      if (people.lastInvite && people.lastInvite.code === code) people.lastInvite = null;
+      toast(t('inviteCanceled'));
+    } catch (err) {
+      toast(t(errKey(err)), true);
+    }
+    people.loaded = false;
+    requestRender();
   }
 
   function onClick(ev) {
@@ -508,13 +1173,68 @@
       case 'tab':
         ui.tab = el.getAttribute('data-tab');
         prefSet('pfl.tab', ui.tab);
+        if (ui.tab === 'setup' && mode === 'shop') people.loaded = false;
         render();
         window.scrollTo(0, 0);
         break;
       case 'lang':
-        data.settings.lang = el.getAttribute('data-lang') === 'es' ? 'es' : 'en';
-        persist(true);
+        lang = el.getAttribute('data-lang') === 'es' ? 'es' : 'en';
+        prefSet('pfl.lang', lang);
+        if (data) {
+          data.settings.lang = lang;
+          if (mode === 'local') persist(true);
+          else if (mode === 'shop') engine.save();
+        }
         render();
+        break;
+      case 'gate': {
+        var screen = el.getAttribute('data-screen');
+        if (mode === 'local') prefSet('pfl.mode', '');
+        showGate(screen);
+        render();
+        window.scrollTo(0, 0);
+        break;
+      }
+      case 'use-local':
+        prefSet('pfl.mode', 'local');
+        openLocal();
+        render();
+        break;
+      case 'reload-shops':
+        loadShops();
+        break;
+      case 'open-shop': {
+        var id = el.getAttribute('data-id');
+        var found = (gate.shops || []).filter(function (s) { return s.id === id; })[0];
+        if (found) openShop(found);
+        break;
+      }
+      case 'switch-shop':
+        showGate('shops');
+        loadShops();
+        break;
+      case 'sign-out':
+        signOut();
+        break;
+      case 'reauth':
+        showGate('signin', { reauth: true });
+        render();
+        break;
+      case 'reload-people':
+        people.loaded = false;
+        render();
+        break;
+      case 'remove-member':
+        removeMember(el.getAttribute('data-id'), el.getAttribute('data-email'));
+        break;
+      case 'cancel-invite':
+        cancelInvite(el.getAttribute('data-id'));
+        break;
+      case 'copy-invite':
+        copyInvite();
+        break;
+      case 'share-invite':
+        shareInvite();
         break;
       case 'day-shift':
         ui.tallyDate = P.addDays(ui.tallyDate, Number(el.getAttribute('data-n')));
@@ -529,9 +1249,9 @@
         render();
         break;
       case 'toggle-worker': {
-        var id = el.getAttribute('data-id');
-        var at = ui.draft.workerIds.indexOf(id);
-        if (at >= 0) ui.draft.workerIds.splice(at, 1); else ui.draft.workerIds.push(id);
+        var wid = el.getAttribute('data-id');
+        var at = ui.draft.workerIds.indexOf(wid);
+        if (at >= 0) ui.draft.workerIds.splice(at, 1); else ui.draft.workerIds.push(wid);
         el.setAttribute('aria-pressed', String(at < 0));
         break;
       }
@@ -545,16 +1265,16 @@
         exportCsv();
         break;
       case 'backup':
-        download('pallet-floor-ledger-backup-' + today() + '.json', JSON.stringify(data, null, 2), 'application/json');
+        download('pallet-floor-ledger-backup-' + today() + '.json', JSON.stringify(backupData(), null, 2), 'application/json');
         toast(t('downloaded'));
         break;
       case 'load-demo':
-        if (!confirm(t('confirmDemo'))) return;
-        replaceData(Demo.build(today(), data.settings.lang), t('demoLoaded'));
+        if (mode !== 'local' || !confirm(t('confirmDemo'))) return;
+        replaceData(Demo.build(today(), lang), t('demoLoaded'));
         break;
       case 'erase':
-        if (!confirm(t('confirmErase'))) return;
-        replaceData(Store.empty(data.settings.lang), t('erased'));
+        if (mode !== 'local' || !confirm(t('confirmErase'))) return;
+        replaceData(Store.empty(lang), t('erased'));
         break;
     }
   }
@@ -620,6 +1340,7 @@
         persist();
         break;
       case 'item-field': {
+        if (!isOwner()) return;
         var field = el.getAttribute('data-field');
         var item = findItem(id);
         if (!item) return;
@@ -636,6 +1357,7 @@
         break;
       }
       case 'item-active': {
+        if (!isOwner()) return;
         var it = findItem(id);
         if (it) { it.active = el.checked; persist(); }
         break;
@@ -643,13 +1365,14 @@
       case 'restore-file': {
         var file = el.files && el.files[0];
         el.value = '';
-        if (!file) return;
+        if (!file || !isOwner()) return;
         var reader = new FileReader();
         reader.onload = function () {
           var next = null;
           try { next = JSON.parse(String(reader.result)); } catch (e) { next = null; }
           if (!Store.valid(next)) { toast(t('restoreFailed'), true); return; }
-          if (!confirm(t('confirmRestore'))) return;
+          if (!confirm(t(mode === 'shop' ? 'confirmRestoreShop' : 'confirmRestore'))) return;
+          if (mode === 'shop') next.demo = false;
           replaceData(next, t('restored'));
         };
         reader.onerror = function () { toast(t('restoreFailed'), true); };
@@ -659,7 +1382,7 @@
     }
   }
 
-  function onSubmit(ev) {
+  async function onSubmit(ev) {
     var form = ev.target;
     var kind = form.getAttribute('data-submit');
     if (!kind) return;
@@ -672,6 +1395,82 @@
     }
 
     switch (kind) {
+      case 'signin':
+      case 'signup': {
+        var email = f.email.value.trim();
+        var password = f.password.value;
+        gate.email = email;
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return fail('gate-error', 'errEmail');
+        if (kind === 'signup' ? password.length < 8 : !password) return fail('gate-error', 'errPassword');
+        document.getElementById('gate-error').textContent = '';
+        busy(form, true);
+        try {
+          if (kind === 'signin') {
+            afterSignIn(await cloud.signIn(email, password));
+          } else {
+            var out = await cloud.signUp(email, password);
+            if (out.needsConfirm) {
+              showGate('signin', { notice: t('errConfirmEmail') });
+              render();
+            } else {
+              afterSignIn(out.session);
+            }
+          }
+        } catch (err) {
+          busy(form, false);
+          fail('gate-error', errKey(err));
+        }
+        break;
+      }
+      case 'join-shop': {
+        var code = normalizeCode(f.code.value);
+        if (code.length < 6) return fail('join-error', 'errInviteInvalid');
+        busy(form, true);
+        gate.joinError = '';
+        if (!(await acceptInvite(code))) {
+          busy(form, false);
+          var box = document.getElementById('join-error');
+          if (box) box.textContent = gate.joinError;
+        }
+        break;
+      }
+      case 'create-shop': {
+        var shopName = f.name.value.trim();
+        if (!shopName) return fail('create-error', 'errShopName');
+        var copy = !!(f.copy && f.copy.checked);
+        busy(form, true);
+        try {
+          var shopId = await cloud.rpc('create_shop', { shop_name: shopName });
+          var initial = copy && localRealData() ? JSON.parse(JSON.stringify(localRealData())) : Store.empty(lang);
+          initial.demo = false;
+          initial.settings.shopName = shopName;
+          initial.settings.lang = lang;
+          ui.tab = copy ? 'tally' : 'setup';
+          prefSet('pfl.tab', ui.tab);
+          openShop({ id: shopId, name: shopName, role: 'owner' }, { initialData: initial, uploadAll: true });
+          toast(t('shopCreated'));
+        } catch (err) {
+          busy(form, false);
+          fail('create-error', errKey(err));
+        }
+        break;
+      }
+      case 'create-invite': {
+        var role = f.role.value === 'owner' ? 'owner' : 'supervisor';
+        busy(form, true);
+        try {
+          var newCode = await cloud.rpc('create_invite', { p_shop: shop.id, p_role: role });
+          people.lastInvite = { code: newCode, role: role };
+          people.loaded = false;
+          render();
+          var panel = $('.invite');
+          if (panel) panel.scrollIntoView({ block: 'nearest' });
+        } catch (err) {
+          busy(form, false);
+          fail('invite-error', errKey(err));
+        }
+        break;
+      }
       case 'add-count': {
         var item = findItem(ui.draft.itemId);
         var count = Number(String(ui.draft.count).trim());
@@ -712,6 +1511,7 @@
         break;
       }
       case 'save-shop': {
+        if (!isOwner()) return;
         var mw = Number(f.minWage.value);
         var ot = Number(f.ot.value);
         if (f.minWage.value.trim() === '' || !(mw >= 0)) return fail('shop-error', 'errMinWage');
@@ -735,6 +1535,7 @@
         break;
       }
       case 'add-item': {
+        if (!isOwner()) return;
         var sku = f.sku.value.trim();
         var task = f.task.value.trim();
         var rate = Number(f.rate.value);
@@ -749,12 +1550,70 @@
 
   // ---------- start ----------
 
+  function readJoinCode() {
+    try {
+      var params = new URLSearchParams(location.search);
+      var c = normalizeCode(params.get('join'));
+      if (c) {
+        prefSet('pfl.join', c);
+        params.delete('join');
+        var rest = params.toString();
+        history.replaceState(null, '', location.pathname + (rest ? '?' + rest : '') + location.hash);
+      }
+    } catch (e) { /* old browser: type the code instead */ }
+    joinCode = normalizeCode(prefGet('pfl.join'));
+  }
+
+  function boot() {
+    if (!cloud) {
+      openLocal();
+      return;
+    }
+    readJoinCode();
+    var user = me();
+    if (user) {
+      var last = readLastShop();
+      if (last && last.userId === user.id && !joinCode && Sync.hasCache(storage, cacheKeyFor(user.id, last.id))) {
+        if (!lang) lang = defaultLang();
+        openShop(last);
+        checkMembership();
+      } else {
+        showGate('shops', { autoOpen: true });
+        loadShops();
+      }
+    } else if (prefGet('pfl.mode') === 'local' && !joinCode) {
+      openLocal();
+    } else {
+      showGate('start');
+    }
+  }
+
   document.addEventListener('click', onClick);
   var view = $('#view');
   view.addEventListener('input', onInput);
   view.addEventListener('change', onChange);
   view.addEventListener('submit', onSubmit);
+  view.addEventListener('focusout', function () {
+    setTimeout(function () { if (renderPending && !typing()) render(); }, 0);
+  });
 
+  document.addEventListener('visibilitychange', function () {
+    if (engine && !document.hidden) {
+      engine.syncNow();
+      checkMembership();
+    }
+  });
+  window.addEventListener('online', function () { if (engine) engine.syncNow(); });
+  window.addEventListener('storage', function (e) {
+    if (engine && e.key === engine.cacheKey) engine.reload();
+    // Signed out in another tab.
+    if (cloud && e.key === cloud.sessionKey && !e.newValue && mode === 'shop') {
+      showGate('start');
+      render();
+    }
+  });
+
+  boot();
   render();
   if (startupNotice) toast(t(startupNotice), true);
 })();

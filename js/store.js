@@ -1,4 +1,5 @@
-/* Pallet Floor Ledger — saving to this browser. v0 keeps everything on one device. */
+/* Pallet Floor Ledger — saving to this browser when the app is used on this device only
+   (no sign-in, or the demo). A signed-in shop is saved by sync.js instead. */
 (function (root) {
   'use strict';
 
@@ -46,6 +47,16 @@
     return { status: 'corrupt', data: null };
   }
 
+  /** What is saved, without side effects. null if nothing or unreadable. */
+  function peek() {
+    try {
+      var d = JSON.parse(root.localStorage.getItem(KEY) || 'null');
+      return valid(d) ? d : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
   function save(d) {
     try {
       root.localStorage.setItem(KEY, JSON.stringify(d));
@@ -55,5 +66,5 @@
     }
   }
 
-  root.Store = { load: load, save: save, valid: valid, empty: empty };
+  root.Store = { load: load, peek: peek, save: save, valid: valid, empty: empty };
 })(this);

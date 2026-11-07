@@ -17,6 +17,7 @@
   --danger: #b42318;
   --danger-ink: #ffffff;
   --focus: #2563eb;
+  --ok-dot: #2e7d32;
   --radius: 10px;
   color-scheme: light;
 }
@@ -39,6 +40,7 @@
     --danger: #f2705f;
     --danger-ink: #1b0b08;
     --focus: #7aa7ff;
+    --ok-dot: #6cc070;
     color-scheme: dark;
   }
 }
@@ -279,6 +281,79 @@ tr.flag td:first-child::after { content: " ⚠"; color: var(--warn-border); }
 .toast.error { background: var(--danger); color: var(--danger-ink); }
 
 .noscript { padding: 16px; }
+
+/* ---------- signing in and sharing ---------- */
+
+.tabs[hidden] { display: none; }
+
+.narrow { max-width: 460px; margin-left: auto; margin-right: auto; }
+.hero h1 { font-size: 1.35rem; line-height: 1.25; margin: 4px 0 10px; }
+.hero .button-stack { margin-top: 16px; }
+.notice {
+  background: var(--accent-soft);
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin: 8px 0 12px;
+  font-size: 0.92rem;
+}
+.switch { margin: 12px 0 0; font-size: 0.92rem; }
+.link {
+  border: 0;
+  background: none;
+  padding: 0;
+  min-height: 44px;
+  color: var(--accent);
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: pointer;
+}
+h3 { font-size: 0.95rem; margin: 16px 0 4px; }
+
+input[type="email"], input[type="password"] {
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 16px;
+  min-width: 0;
+}
+.inline-form select { min-height: 40px; }
+
+fieldset:disabled input, fieldset:disabled select { opacity: 0.7; }
+button:disabled { opacity: 0.6; cursor: default; }
+
+.check.wrap { white-space: normal; align-items: flex-start; font-size: 0.9rem; }
+.check.wrap input { flex: none; margin-top: 1px; }
+
+.shop-button { display: flex; align-items: center; justify-content: space-between; gap: 12px; text-align: left; min-height: 52px; }
+.shop-button .muted { font-weight: 400; font-size: 0.85rem; }
+
+.button-row { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.banner.alert { background: var(--warn-bg); border-color: var(--warn-border); }
+
+/* The status line under the shop name: is everything on the server? */
+.product.sync { display: flex; align-items: center; gap: 6px; }
+.product.sync::before { content: ""; width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--muted); }
+.product.sync.ok::before { background: var(--ok-dot); }
+.product.sync.busy::before { background: var(--accent); }
+.product.sync.warn::before { background: var(--warn-border); }
+.product.sync.bad { color: var(--danger); }
+.product.sync.bad::before { background: var(--danger); }
+
+.invite {
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px dashed var(--accent);
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.invite-code, .mono { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; letter-spacing: 0.06em; }
+.invite-code { font-size: 1.7rem; font-weight: 700; margin: 6px 0 0; }
+.invite-link { width: 100%; margin: 10px 0; font-size: 14px !important; }
 
 @media (max-width: 520px) {
   .rate-row { grid-template-columns: 1fr 1fr; }

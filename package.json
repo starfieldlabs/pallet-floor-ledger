@@ -1,9 +1,13 @@
 {
   "name": "pallet-floor-ledger",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Production tally to piece-rate payroll for pallet yards.",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "test:db": "node --test supabase/check-rules.mjs"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.2.17"
   }
 }
